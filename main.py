@@ -30,11 +30,6 @@ def adjust_cpu_limit(process, value):
     p.nice(10)
 
 
-def adjust_gpu_limit(process, value):
-    # TODO
-    pass
-
-
 def get_max_memory():
     return 1024 * 1024 * 1024
 
@@ -43,19 +38,13 @@ def get_max_cpu():
     return 50
 
 
-def get_max_gpu():
-    return 50
-
-
 def monitor_memory_and_cpu(process, process_finished):
     while not process_finished.is_set():
         max_memory_bytes = get_max_memory()
         max_cpu_percent = get_max_cpu()
-        max_gpu_percent = get_max_gpu()
 
         adjust_memory_limit(process, max_memory_bytes)
         adjust_cpu_limit(process, max_cpu_percent)
-        adjust_gpu_limit(process, max_gpu_percent)
 
         time.sleep(1)  # Adjust the sleep duration as needed
 
