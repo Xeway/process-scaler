@@ -10,14 +10,15 @@ import (
 )
 
 func getMaxMemory() int64 {
-	return 1 * 1024 * 1024 * 1024
+	return 1 * 1024 * 1024 * 1024 // 1GB in bytes
 }
 
-func getMaxCPU() uint64 {
-	return 50000
+func getMaxCPU() (int64, uint64) {
+	return 50000, 100000 // runs for 50ms every 100ms, so 50% CPU
 }
 
 func monitorMemoryAndCPU(cgroup *cgroup2.Manager, processFinished chan bool) {
+	fmt.Println("Monitoring memory and CPU usage while the process is running")
 	for {
 		select {
 		// Exit when the process has finished
@@ -25,21 +26,21 @@ func monitorMemoryAndCPU(cgroup *cgroup2.Manager, processFinished chan bool) {
 			return
 		default:
 			maxMemoryBytes := getMaxMemory()
-			maxCPUPercent := getMaxCPU()
+			cpuQuota, cpuPeriod := getMaxCPU()
 
 			res := cgroup2.Resources{
 				Memory: &cgroup2.Memory{
 					Max: &maxMemoryBytes,
 				},
 				CPU: &cgroup2.CPU{
-					Max: cgroup2.NewCPUMax(nil, &maxCPUPercent),
+					Max: cgroup2.NewCPUMax(&cpuQuota, &cpuPeriod),
 				},
 			}
-			// update
+			// Update
 			if err := cgroup.Update(&res); err != nil {
-				return
+				log.Fatal(err)
 			}
-			time.Sleep(1 * time.Second) // Check every second
+			time.Sleep(1 * time.Second) // Monitor every second
 		}
 	}
 }
@@ -55,8 +56,13 @@ func createCgroup(proc *exec.Cmd) *cgroup2.Manager {
 		log.Fatal(err)
 	}
 
+	// Enable the memory and CPU controllers
+	if err = m.ToggleControllers([]string{"memory", "cpu"}, cgroup2.Enable); err != nil {
+		log.Fatal(err)
+	}
+
 	// Add the process to the cgroup
-	if err := m.AddProc(uint64(proc.Process.Pid)); err != nil {
+	if err = m.AddProc(uint64(proc.Process.Pid)); err != nil {
 		log.Fatal(err)
 	}
 
