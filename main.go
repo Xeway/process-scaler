@@ -98,6 +98,9 @@ func main() {
 	if len(os.Args) < 2 {
 		log.Fatal("Usage: go run main.go <command> <args>")
 	}
+	if cgroups.Mode() != cgroups.Unified {
+		log.Fatal("This program requires cgroup v2")
+	}
 
 	// Run external program
 	proc := exec.Command(os.Args[1], os.Args[2:]...)
