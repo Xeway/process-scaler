@@ -11,7 +11,6 @@ import (
 	"math"
 	"os"
 	"os/exec"
-	"runtime"
 	"sync"
 	"time"
 )
@@ -70,11 +69,7 @@ func getMaxMemory(cgStat *stats.MemoryStat) int64 {
 
 // Copied from https://github.com/shirou/gopsutil/blob/v3.24.2/cpu/cpu.go#L104
 func getAllBusy(t cpu.TimesStat) (float64, float64) {
-	tot := t.Total()
-	if runtime.GOOS == "linux" {
-		tot -= t.Guest     // Linux 2.6.24+
-		tot -= t.GuestNice // Linux 3.2.0+
-	}
+	tot := t.User + t.System + t.Idle + t.Nice + t.Iowait + t.Irq + t.Softirq + t.Steal
 
 	busy := tot - t.Idle - t.Iowait
 
