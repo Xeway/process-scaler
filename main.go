@@ -55,16 +55,17 @@ func getMaxMemory(cgStat *stats.MemoryStat) int64 {
 		log.Fatal(err)
 	}
 
-	cgMem := float64(cgStat.GetUsageLimit())
+	cgMem := int64(cgStat.GetUsageLimit())
 	availableMem := float64(v.Available)
 	totalMem := float64(v.Total)
 
+	memMargin := totalMem * Margin
 	// If available memory less than margin, readjust
-	if availableMem < totalMem*Margin {
-		return int64((cgMem - availableMem) * (1 - Margin))
+	if availableMem < memMargin {
+		return cgMem - int64(memMargin-availableMem)
 	}
 	// If available memory more than margin, readjust
-	return int64((cgMem + availableMem) * (1 - Margin))
+	return cgMem + int64(availableMem-memMargin)
 }
 
 // Copied from https://github.com/shirou/gopsutil/blob/v3.24.2/cpu/cpu.go#L104
