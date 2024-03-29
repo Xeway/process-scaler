@@ -105,8 +105,8 @@ func getMaxCPU(cgStat *stats.CPUStat) (int64, uint64) {
 	lastAll, lastBusy := getAllBusy(lastTimes[0])
 
 	cgCPU := math.Max(0, float64(curCgTimes-lastCgTimes))
-	availableCPU := math.Max(0, curBusy-lastBusy) * 1e6 // Seconds to microseconds
-	totalCPU := math.Max(0, curAll-lastAll) * 1e6
+	totalCPU := math.Max(0, curAll-lastAll) * 1e6 // Seconds to microseconds
+	availableCPU := math.Max(0, totalCPU-(curBusy-lastBusy)*1e6)
 
 	cpuMargin := totalCPU * Margin
 	// If available CPU less than margin, readjust
