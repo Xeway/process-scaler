@@ -113,9 +113,10 @@ func getMaxCPU(cgStat *stats.CPUStat) (int64, uint64) {
 	return int64(100000 * (cgCPU + (availableCPU - cpuMargin)) / totalCPU), 100000
 }
 
-func monitorMemoryAndCPU(cgManager *cgroup2.Manager, processFinished chan bool) {
-	fmt.Println("Monitoring memory and CPU usage while the process is running")
+func monitorResources(cgManager *cgroup2.Manager, processFinished chan bool) {
+	fmt.Println("Monitoring resources usage while the process is running")
 	initTimes(cgManager)
+
 	for {
 		select {
 		// Exit when the process has finished
@@ -159,8 +160,8 @@ func createCgroup(proc *exec.Cmd) *cgroup2.Manager {
 		log.Fatal(err)
 	}
 
-	// Enable the memory and CPU controllers
-	if err = m.ToggleControllers([]string{"memory", "cpu"}, cgroup2.Enable); err != nil {
+	// Enable the relevant controllers
+	if err = m.ToggleControllers([]string{"memory", "cpu", "io"}, cgroup2.Enable); err != nil {
 		log.Fatal(err)
 	}
 
@@ -192,7 +193,7 @@ func main() {
 	// Channel to signal when the process has finished
 	processFinished := make(chan bool)
 
-	go monitorMemoryAndCPU(cgManager, processFinished)
+	go monitorResources(cgManager, processFinished)
 
 	// Wait for the program to finish
 	if err := proc.Wait(); err != nil {
