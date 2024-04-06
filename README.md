@@ -11,6 +11,7 @@ The readjustment of the resource limits is done every second.
 
 - Linux system
 - cgroups v2
+- `dd`, `hdparm`, `lsblk` commands
 
 ## Usage
 
