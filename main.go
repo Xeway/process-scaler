@@ -1,19 +1,39 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"github.com/containerd/cgroups/v3"
 	"github.com/containerd/cgroups/v3/cgroup2"
 	"github.com/containerd/cgroups/v3/cgroup2/stats"
+	"github.com/google/uuid"
 	"github.com/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/mem"
 	"log"
 	"math"
 	"os"
 	"os/exec"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
+
+type maxIO struct {
+	read  uint64
+	write uint64
+}
+
+type lsblkOutputListJSON struct {
+	Blockdevices []lsblkOutputJSON `json:"blockdevices"`
+}
+
+type lsblkOutputJSON struct {
+	Kname  string `json:"kname"`
+	MajMin string `json:"maj:min"`
+}
 
 type lastCPUTimeStats struct {
 	sync.Mutex
@@ -21,15 +41,24 @@ type lastCPUTimeStats struct {
 	cg     uint64          // CPU time for the cgroup
 }
 
+type lastIOCountersStats struct {
+	sync.Mutex
+	system map[string]disk.IOCountersStat
+	cg     []*stats.IOEntry
+}
+
 var (
-	lastCPUTimes lastCPUTimeStats
+	lastCPUTimes   lastCPUTimeStats
+	lastIOCounters lastIOCountersStats
+	lsblkOutput    lsblkOutputListJSON
+	ioBenchmark    map[string]maxIO // Max read/write in bytes for one second for each device
 )
 
 const (
 	Margin = 0.1
 )
 
-func initTimes(cgManager *cgroup2.Manager) {
+func initCPUTimes(cgManager *cgroup2.Manager) {
 	lastCPUTimes.Lock()
 
 	times, err := cpu.Times(false)
@@ -45,8 +74,24 @@ func initTimes(cgManager *cgroup2.Manager) {
 	lastCPUTimes.cg = cgStats.GetCPU().GetUsageUsec()
 
 	lastCPUTimes.Unlock()
+}
 
-	time.Sleep(1 * time.Second)
+func initIOCounters(cgManager *cgroup2.Manager) {
+	lastIOCounters.Lock()
+
+	counters, err := disk.IOCounters()
+	if err != nil {
+		log.Fatal(err)
+	}
+	lastIOCounters.system = counters
+
+	cgStats, err := cgManager.Stat()
+	if err != nil {
+		log.Fatal(err)
+	}
+	lastIOCounters.cg = cgStats.GetIo().GetUsage()
+
+	lastIOCounters.Unlock()
 }
 
 func getMaxMemory(cgStat *stats.MemoryStat) int64 {
@@ -102,7 +147,7 @@ func getMaxCPU(cgStat *stats.CPUStat) (int64, uint64) {
 
 	cgCPU := math.Max(0, float64(curCgTimes-lastCgTimes))
 	totalCPU := math.Max(0, curAll-lastAll) * 1e6 // Seconds to microseconds
-	availableCPU := math.Max(0, totalCPU-(curBusy-lastBusy)*1e6)
+	availableCPU := math.Max(0, totalCPU-math.Max(0, curBusy-lastBusy)*1e6)
 
 	cpuMargin := totalCPU * Margin
 	// If available CPU less than margin, readjust
@@ -113,9 +158,200 @@ func getMaxCPU(cgStat *stats.CPUStat) (int64, uint64) {
 	return int64(100000 * (cgCPU + (availableCPU - cpuMargin)) / totalCPU), 100000
 }
 
+func setMaxIO(outputCmd []byte, max *maxIO, read bool) {
+	// Get last (unit) and before last (value) word of last line of the output
+	words := bytes.Fields(outputCmd)
+	value, err := strconv.ParseFloat(string(words[len(words)-2]), 64)
+	if err != nil {
+		return
+	}
+
+	var result uint64
+	// ex: MB/sec => MB
+	unit := strings.Split(string(words[len(words)-1]), "/")[0]
+	if unit == "kB" {
+		result = uint64(value * 1024)
+	} else if unit == "MB" {
+		result = uint64(value * 1024 * 1024)
+	} else if unit == "GB" {
+		result = uint64(value * 1024 * 1024 * 1024)
+	} else if unit == "TB" {
+		result = uint64(value * 1024 * 1024 * 1024 * 1024)
+	} else {
+		result = uint64(value)
+	}
+
+	if read {
+		max.read = result
+	} else {
+		max.write = result
+	}
+}
+
+func benchmarkReadIO(device lsblkOutputJSON, max *maxIO) {
+	hdparm := exec.Command("sudo", "hdparm", "-Tt", "/dev/"+device.Kname)
+	outputHdparmCmd, err := hdparm.Output()
+	if err == nil {
+		setMaxIO(outputHdparmCmd, max, true)
+	}
+}
+
+func benchmarkWriteIO(device lsblkOutputJSON, uniqueFileName string, max *maxIO) {
+	// Mount the device
+	mount := exec.Command("sudo", "mount", "/dev/"+device.Kname, "/tmp")
+	if err := mount.Run(); err != nil {
+		return
+	}
+
+	dd := exec.Command("sudo dd", "if=/dev/zero", "of="+uniqueFileName, "bs=8k", "count=10k")
+
+	var outputDdCmd bytes.Buffer
+	dd.Stderr = &outputDdCmd
+
+	if err := dd.Run(); err == nil {
+		setMaxIO(outputDdCmd.Bytes(), max, false)
+	}
+
+	_ = exec.Command("sudo", "sync", uniqueFileName).Run()
+	_ = exec.Command("sudo", "rm", "-f", uniqueFileName).Run()
+	_ = exec.Command("sudo", "umount", "/tmp").Run()
+}
+
+// Benchmark IO speed for each device
+// Method: https://askubuntu.com/a/87036
+func benchmarkIO() {
+	fmt.Println("Before running the process, benchmarking IO...")
+
+	ioBenchmark = make(map[string]maxIO)
+	result := maxIO{}
+
+	// Run lsblk command to get the list of block devices with their major and minor numbers
+	lsblk := exec.Command("lsblk", "-a", "-n", "-J", "-o", "KNAME,MAJ:MIN")
+	outputHdparmCmd, err := lsblk.Output()
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err = json.Unmarshal(outputHdparmCmd, &lsblkOutput); err != nil {
+		log.Fatal(err)
+	}
+
+	uniqueFileName := fmt.Sprintf("/tmp/output_%s", uuid.New().String())
+
+	for _, device := range lsblkOutput.Blockdevices {
+		benchmarkReadIO(device, &result)
+		benchmarkWriteIO(device, uniqueFileName, &result)
+
+		ioBenchmark[device.Kname] = result
+	}
+
+	fmt.Println("Finished benchmarking IO")
+}
+
+func getMajorMinor(deviceName string) (int64, int64) {
+	// Loop over each block device to find the one with the correct name and return its major and minor
+	for _, device := range lsblkOutput.Blockdevices {
+		if device.Kname == deviceName {
+			var major, minor int64
+			if _, err := fmt.Sscanf(device.MajMin, "%d:%d", &major, &minor); err != nil {
+				log.Fatal(err)
+			}
+			return major, minor
+		}
+	}
+
+	return -1, -1
+}
+
+func findWithMajorMinor(curCgCounters []*stats.IOEntry, major, minor uint64) *stats.IOEntry {
+	for _, v := range curCgCounters {
+		if v.Major == major && v.Minor == minor {
+			return v
+		}
+	}
+	return nil
+}
+
+func getMaxIO(cgStat *stats.IOStat) []cgroup2.Entry {
+	curCgCounters := cgStat.GetUsage()
+
+	curCounters, err := disk.IOCounters()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Mutex lock
+	lastIOCounters.Lock()
+	defer lastIOCounters.Unlock()
+
+	lastCgCounters := lastIOCounters.cg
+	lastIOCounters.cg = curCgCounters
+
+	lastCounters := lastIOCounters.system
+	lastIOCounters.system = curCounters
+
+	result := make([]cgroup2.Entry, 0)
+
+	for device, curCounter := range curCounters {
+		major, minor := getMajorMinor(device)
+		if major == -1 || minor == -1 {
+			continue
+		}
+
+		lastCounter := lastCounters[device]
+		curCgCounter := findWithMajorMinor(curCgCounters, uint64(major), uint64(minor))
+		lastCgCounter := findWithMajorMinor(lastCgCounters, uint64(major), uint64(minor))
+
+		if (lastCounter != disk.IOCountersStat{}) {
+			// Read
+			cgBytesRead := math.Max(0, float64(curCgCounter.GetRbytes()-lastCgCounter.GetRbytes()))
+			maxBytesRead := float64(ioBenchmark[device].read)
+			availableBytesRead := math.Max(0, maxBytesRead-math.Max(0, float64(curCounter.ReadBytes-lastCounter.ReadBytes)))
+
+			readMargin := maxBytesRead * Margin
+
+			readEntry := cgroup2.Entry{
+				Type:  "rbytes",
+				Major: major,
+				Minor: minor,
+			}
+			// If available IO read less than margin, readjust
+			if availableBytesRead < readMargin {
+				readEntry.Rate = uint64(cgBytesRead - (readMargin - availableBytesRead))
+			} else {
+				readEntry.Rate = uint64(cgBytesRead + (availableBytesRead - readMargin))
+			}
+			result = append(result, readEntry)
+
+			// Write
+			cgBytesWrite := math.Max(0, float64(curCgCounter.GetWbytes()-lastCgCounter.GetWbytes()))
+			maxBytesWrite := float64(ioBenchmark[device].write)
+			availableBytesWrite := math.Max(0, maxBytesWrite-math.Max(0, float64(curCounter.WriteBytes-lastCounter.WriteBytes)))
+
+			writeMargin := maxBytesWrite * Margin
+
+			writeEntry := cgroup2.Entry{
+				Type:  "wbytes",
+				Major: major,
+				Minor: minor,
+			}
+			// If available IO write less than margin, readjust
+			if availableBytesWrite < writeMargin {
+				writeEntry.Rate = uint64(cgBytesWrite - (writeMargin - availableBytesWrite))
+			} else {
+				writeEntry.Rate = uint64(cgBytesWrite + (availableBytesWrite - writeMargin))
+			}
+			result = append(result, writeEntry)
+		}
+	}
+
+	return result
+}
+
 func monitorResources(cgManager *cgroup2.Manager, processFinished chan bool) {
 	fmt.Println("Monitoring resources usage while the process is running")
-	initTimes(cgManager)
+	initCPUTimes(cgManager)
+	initIOCounters(cgManager)
+	time.Sleep(1 * time.Second)
 
 	for {
 		select {
@@ -130,6 +366,7 @@ func monitorResources(cgManager *cgroup2.Manager, processFinished chan bool) {
 
 			maxMemoryBytes := getMaxMemory(cgStats.GetMemory())
 			cpuQuota, cpuPeriod := getMaxCPU(cgStats.GetCPU())
+			maxIOEntry := getMaxIO(cgStats.GetIo())
 
 			res := cgroup2.Resources{
 				Memory: &cgroup2.Memory{
@@ -138,6 +375,9 @@ func monitorResources(cgManager *cgroup2.Manager, processFinished chan bool) {
 				CPU: &cgroup2.CPU{
 					// Runs cpuQuota microseconds every cpuPeriod microseconds
 					Max: cgroup2.NewCPUMax(&cpuQuota, &cpuPeriod),
+				},
+				IO: &cgroup2.IO{
+					Max: maxIOEntry,
 				},
 			}
 			// Update
@@ -180,6 +420,8 @@ func main() {
 	if cgroups.Mode() != cgroups.Unified {
 		log.Fatal("This program requires cgroup v2")
 	}
+
+	benchmarkIO()
 
 	// Run external program
 	proc := exec.Command(os.Args[1], os.Args[2:]...)

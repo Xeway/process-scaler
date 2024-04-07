@@ -4,6 +4,7 @@ go 1.19
 
 require (
 	github.com/containerd/cgroups/v3 v3.0.3
+	github.com/google/uuid v1.6.0
 	github.com/shirou/gopsutil/v3 v3.24.2
 )
 
