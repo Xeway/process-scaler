@@ -31,8 +31,11 @@ type lsblkOutputListJSON struct {
 }
 
 type lsblkOutputJSON struct {
-	Kname  string `json:"kname"`
-	MajMin string `json:"maj:min"`
+	Name     string            `json:"name"`
+	Kname    string            `json:"kname"`
+	MajMin   string            `json:"maj:min"`
+	Type     string            `json:"type"`
+	Children []lsblkOutputJSON `json:"children"`
 }
 
 type lastCPUTimeStats struct {
@@ -50,7 +53,7 @@ type lastIOCountersStats struct {
 var (
 	lastCPUTimes   lastCPUTimeStats
 	lastIOCounters lastIOCountersStats
-	lsblkOutput    lsblkOutputListJSON
+	lsblk          map[string]lsblkOutputJSON
 	ioBenchmark    map[string]maxIO // Max read/write in bytes for one second for each device
 )
 
@@ -182,9 +185,9 @@ func setMaxIO(outputCmd []byte, max *maxIO, read bool) {
 	}
 
 	if read {
-		max.read = result
+		max.read += result
 	} else {
-		max.write = result
+		max.write += result
 	}
 }
 
@@ -217,53 +220,59 @@ func benchmarkWriteIO(device lsblkOutputJSON, uniqueFileName string, max *maxIO)
 	_ = exec.Command("sudo", "umount", "/tmp").Run()
 }
 
+func recursiveBenchmarkIO(device lsblkOutputJSON, uniqueFileName *string, max *maxIO) {
+	if device.Children != nil && len(device.Children) > 0 {
+		for _, child := range device.Children {
+			recursiveBenchmarkIO(child, uniqueFileName, max)
+		}
+	}
+	benchmarkReadIO(device, max)
+	benchmarkWriteIO(device, *uniqueFileName, max)
+}
+
 // Benchmark IO speed for each device
 // Method: https://askubuntu.com/a/87036
 func benchmarkIO() {
 	fmt.Println("Before running the process, benchmarking IO...")
 
+	lsblk = make(map[string]lsblkOutputJSON)
 	ioBenchmark = make(map[string]maxIO)
-	result := maxIO{}
 
 	// Run lsblk command to get the list of block devices with their major and minor numbers
-	lsblk := exec.Command("lsblk", "-a", "-n", "-J", "-o", "KNAME,MAJ:MIN")
-	outputHdparmCmd, err := lsblk.Output()
+	lsblkCmd := exec.Command("sudo", "lsblk", "-anJo", "NAME,KNAME,MAJ:MIN,TYPE")
+	outputLsblkCmd, err := lsblkCmd.Output()
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err = json.Unmarshal(outputHdparmCmd, &lsblkOutput); err != nil {
+	var lsblkOutput lsblkOutputListJSON
+	if err = json.Unmarshal(outputLsblkCmd, &lsblkOutput); err != nil {
 		log.Fatal(err)
+	}
+	// Filter to remove all non-physical devices
+	// We don't go deeper than the first level of children
+	// Because physical devices are at the first level
+	for _, device := range lsblkOutput.Blockdevices {
+		if device.Type == "disk" {
+			lsblk[device.Kname] = device
+		}
 	}
 
 	uniqueFileName := fmt.Sprintf("/tmp/output_%s", uuid.New().String())
 
-	for _, device := range lsblkOutput.Blockdevices {
-		benchmarkReadIO(device, &result)
-		benchmarkWriteIO(device, uniqueFileName, &result)
-
-		ioBenchmark[device.Kname] = result
+	for _, device := range lsblk {
+		max := maxIO{
+			read:  0,
+			write: 0,
+		}
+		recursiveBenchmarkIO(device, &uniqueFileName, &max)
+		ioBenchmark[device.Kname] = max
 	}
 
 	fmt.Println("Finished benchmarking IO")
 }
 
-func getMajorMinor(deviceName string) (int64, int64) {
-	// Loop over each block device to find the one with the correct name and return its major and minor
-	for _, device := range lsblkOutput.Blockdevices {
-		if device.Kname == deviceName {
-			var major, minor int64
-			if _, err := fmt.Sscanf(device.MajMin, "%d:%d", &major, &minor); err != nil {
-				log.Fatal(err)
-			}
-			return major, minor
-		}
-	}
-
-	return -1, -1
-}
-
-func findWithMajorMinor(curCgCounters []*stats.IOEntry, major, minor uint64) *stats.IOEntry {
-	for _, v := range curCgCounters {
+func findWithMajorMinor(counters []*stats.IOEntry, major, minor uint64) *stats.IOEntry {
+	for _, v := range counters {
 		if v.Major == major && v.Minor == minor {
 			return v
 		}
@@ -291,20 +300,25 @@ func getMaxIO(cgStat *stats.IOStat) []cgroup2.Entry {
 
 	result := make([]cgroup2.Entry, 0)
 
-	for device, curCounter := range curCounters {
-		major, minor := getMajorMinor(device)
-		if major == -1 || minor == -1 {
+	for deviceName, curCounter := range curCounters {
+		device, exists := lsblk[deviceName]
+		if !exists {
 			continue
 		}
 
-		lastCounter := lastCounters[device]
+		var major, minor int64
+		if _, err = fmt.Sscanf(device.MajMin, "%d:%d", &major, &minor); err != nil {
+			continue
+		}
+
+		lastCounter := lastCounters[deviceName]
 		curCgCounter := findWithMajorMinor(curCgCounters, uint64(major), uint64(minor))
 		lastCgCounter := findWithMajorMinor(lastCgCounters, uint64(major), uint64(minor))
 
 		if (lastCounter != disk.IOCountersStat{}) {
 			// Read
 			cgBytesRead := math.Max(0, float64(curCgCounter.GetRbytes()-lastCgCounter.GetRbytes()))
-			maxBytesRead := float64(ioBenchmark[device].read)
+			maxBytesRead := float64(ioBenchmark[deviceName].read)
 			availableBytesRead := math.Max(0, maxBytesRead-math.Max(0, float64(curCounter.ReadBytes-lastCounter.ReadBytes)))
 
 			readMargin := maxBytesRead * Margin
@@ -324,7 +338,7 @@ func getMaxIO(cgStat *stats.IOStat) []cgroup2.Entry {
 
 			// Write
 			cgBytesWrite := math.Max(0, float64(curCgCounter.GetWbytes()-lastCgCounter.GetWbytes()))
-			maxBytesWrite := float64(ioBenchmark[device].write)
+			maxBytesWrite := float64(ioBenchmark[deviceName].write)
 			availableBytesWrite := math.Max(0, maxBytesWrite-math.Max(0, float64(curCounter.WriteBytes-lastCounter.WriteBytes)))
 
 			writeMargin := maxBytesWrite * Margin
