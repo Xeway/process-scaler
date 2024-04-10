@@ -334,7 +334,9 @@ func getMaxIO(cgStat *stats.IOStat) []cgroup2.Entry {
 			} else {
 				readEntry.Rate = uint64(cgBytesRead + (availableBytesRead - readMargin))
 			}
-			result = append(result, readEntry)
+			if readEntry.Rate > 0 {
+				result = append(result, readEntry)
+			}
 
 			// Write
 			cgBytesWrite := math.Max(0, float64(curCgCounter.GetWbytes()-lastCgCounter.GetWbytes()))
@@ -354,7 +356,9 @@ func getMaxIO(cgStat *stats.IOStat) []cgroup2.Entry {
 			} else {
 				writeEntry.Rate = uint64(cgBytesWrite + (availableBytesWrite - writeMargin))
 			}
-			result = append(result, writeEntry)
+			if writeEntry.Rate > 0 {
+				result = append(result, writeEntry)
+			}
 		}
 	}
 
