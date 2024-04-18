@@ -324,7 +324,7 @@ func getMaxIO(cgStat *stats.IOStat) []cgroup2.Entry {
 			readMargin := maxBytesRead * Margin
 
 			readEntry := cgroup2.Entry{
-				Type:  "rbps",
+				Type:  cgroup2.ReadBPS,
 				Major: major,
 				Minor: minor,
 			}
@@ -346,7 +346,7 @@ func getMaxIO(cgStat *stats.IOStat) []cgroup2.Entry {
 			writeMargin := maxBytesWrite * Margin
 
 			writeEntry := cgroup2.Entry{
-				Type:  "wbps",
+				Type:  cgroup2.WriteBPS,
 				Major: major,
 				Minor: minor,
 			}
