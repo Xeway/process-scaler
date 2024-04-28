@@ -172,15 +172,16 @@ func setMaxIO(outputCmd []byte, max *maxIO, read bool) {
 	var result uint64
 	// ex: MB/sec => MB
 	unit := strings.Split(string(words[len(words)-1]), "/")[0]
-	if unit == "kB" {
+	switch unit {
+	case "kB":
 		result = uint64(value * 1024)
-	} else if unit == "MB" {
+	case "MB":
 		result = uint64(value * 1024 * 1024)
-	} else if unit == "GB" {
+	case "GB":
 		result = uint64(value * 1024 * 1024 * 1024)
-	} else if unit == "TB" {
+	case "TB":
 		result = uint64(value * 1024 * 1024 * 1024 * 1024)
-	} else {
+	default:
 		result = uint64(value)
 	}
 
